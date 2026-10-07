@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import os
 import re
 import signal
@@ -62,12 +63,15 @@ from ucode.managed_files import (
     managed_file_conflicts,
     managed_file_is_verified,
     managed_file_scope,
+    managed_file_snapshots,
     managed_file_status,
     managed_files_supported,
+    managed_write_batch,
     managed_writes_allowed,
     mark_managed_file_verified,
     read_managed_file,
     reconcile_managed_file,
+    record_ug_picker,
     revert_managed_file,
 )
 from ucode.os_compatibility import subprocess_cross_os
@@ -122,7 +126,11 @@ MANAGED_KEYS: list[list[str]] = [
     ["model"],
     ["model_providers", CODEX_MODEL_PROVIDER_NAME],
     ["model_providers", CODEX_MODEL_PROVIDER_NAME, "http_headers"],
+    ["model_catalog_json"],
 ]
+
+MANAGED_CATALOG_TOOL = "codex-catalog"
+MANAGED_CATALOG_FILENAME = "ucode-model-catalog.json"
 
 LEGACY_MANAGED_KEYS: list[list[str]] = [
     ["profile"],
@@ -514,7 +522,34 @@ def write_tool_config(
         enabled=False,
     )
     write_toml_file(CODEX_CONFIG_PATH, doc)
-    _reconcile_managed_config(state, lambda base: compose(base, include_catalog=False))
+    managed_path = codex_managed_config_path()
+    managed_catalog = _managed_catalog_path(managed_path) if managed_path else None
+    managed_catalog_path = (
+        str(managed_catalog)
+        if managed_catalog and (managed_writes_allowed() or managed_catalog.is_file())
+        else None
+    )
+
+    def compose_managed(base: dict) -> dict:
+        prior_catalog = base.get("model_catalog_json")
+        compose(base, include_catalog=False)
+        if catalog is not None and managed_catalog_path:
+            base["model_catalog_json"] = managed_catalog_path
+        elif prior_catalog is not None:
+            # Revert only the catalog ug recorded writing, and only while it is untouched.
+            snapshots = managed_file_snapshots("codex", _parse_managed_config)
+            ug_catalog = (snapshots.ug_picker or {}).get("model_catalog_json")
+            if ug_catalog is not None and str(prior_catalog) == str(ug_catalog):
+                baseline = snapshots.original_before_ug or {}
+                if "model_catalog_json" in baseline:
+                    base["model_catalog_json"] = baseline["model_catalog_json"]
+                else:
+                    base.pop("model_catalog_json", None)
+        return base
+
+    _reconcile_managed_config(
+        state, compose_managed, catalog=catalog if managed_catalog_path else None
+    )
     state = mark_tool_managed(state, "codex", MANAGED_KEYS)
     save_state(state)
     return state
@@ -577,15 +612,58 @@ def managed_config_status(state: dict) -> tuple[Path | None, str, str]:
 
 
 def revert_managed_config() -> str:
-    return revert_managed_file(
+    result = revert_managed_file(
         "codex",
         display="Codex",
         parser=_parse_managed_config,
         dumper=tomlkit.dumps,
     )
+    _revert_managed_catalog()
+    return result
 
 
-def _reconcile_managed_config(state: dict, compose: Callable[[dict], dict]) -> None:
+def _managed_catalog_path(managed_path: Path) -> Path:
+    return managed_path.with_name(MANAGED_CATALOG_FILENAME)
+
+
+def _dump_catalog(catalog: dict) -> str:
+    return json.dumps(catalog, indent=2) + "\n"
+
+
+def _write_managed_catalog(path: Path, text: str) -> str:
+    return reconcile_managed_file(
+        path,
+        text,
+        tool=MANAGED_CATALOG_TOOL,
+        display="Codex model catalog",
+        owned_paths=[],
+        parser=json.loads,
+    )
+
+
+def _restore_managed_catalog(path: Path, text: str | None) -> None:
+    """Undo a catalog write whose managed config write failed, so the two stay consistent."""
+    try:
+        if text is None:
+            _revert_managed_catalog()
+        else:
+            _write_managed_catalog(path, text)
+    except RuntimeError as exc:
+        print_warning_err(f"Could not restore the Codex model catalog at {path}: {exc}")
+
+
+def _revert_managed_catalog() -> str:
+    return revert_managed_file(
+        MANAGED_CATALOG_TOOL,
+        display="Codex model catalog",
+        parser=json.loads,
+        dumper=_dump_catalog,
+    )
+
+
+def _reconcile_managed_config(
+    state: dict, compose: Callable[[dict], dict], *, catalog: dict | None = None
+) -> None:
     """Reconcile Codex's highest-precedence config while preserving unrelated policy."""
     path = codex_managed_config_path()
     if path is None:
@@ -610,18 +688,37 @@ def _reconcile_managed_config(state: dict, compose: Callable[[dict], dict]) -> N
     managed_before = copy.deepcopy(existing)
     desired_doc = compose(existing)
     conflicts = managed_file_conflicts(managed_before, desired_doc, MANAGED_KEYS)
+    managed_catalog = _managed_catalog_path(path)
+    if (
+        catalog is not None
+        and str(managed_before.get("model_catalog_json")) == str(managed_catalog)
+        and read_managed_file(managed_catalog) != _dump_catalog(catalog)
+    ):
+        conflicts.append("model_catalog_json")
     if not managed_writes_allowed() and not conflicts:
         mark_managed_file_verified(state, "codex", path, scope="local-compatible")
         return
     try:
-        reconcile_managed_file(
-            path,
-            tomlkit.dumps(desired_doc),
-            tool="codex",
-            display="Codex",
-            owned_paths=MANAGED_KEYS,
-            parser=_parse_managed_config,
-        )
+        with managed_write_batch(["Codex"]):
+            prior_catalog_text = read_managed_file(managed_catalog)
+            catalog_result = (
+                _write_managed_catalog(managed_catalog, _dump_catalog(catalog))
+                if catalog is not None
+                else None
+            )
+            try:
+                reconcile_managed_file(
+                    path,
+                    tomlkit.dumps(desired_doc),
+                    tool="codex",
+                    display="Codex",
+                    owned_paths=MANAGED_KEYS,
+                    parser=_parse_managed_config,
+                )
+            except Exception:
+                if catalog_result in ("created", "written"):
+                    _restore_managed_catalog(managed_catalog, prior_catalog_text)
+                raise
     except ManagedFileWriteUnavailable:
         if conflicts:
             raise
@@ -631,7 +728,18 @@ def _reconcile_managed_config(state: dict, compose: Callable[[dict], dict]) -> N
         )
         mark_managed_file_verified(state, "codex", path, scope="local-compatible")
         return
+    if catalog is None and not is_dry_run():
+        try:
+            _revert_managed_catalog()
+        except RuntimeError as exc:
+            print_warning_err(str(exc))
     mark_managed_file_verified(state, "codex", path)
+    record_ug_picker(
+        "codex",
+        {"model_catalog_json": str(desired_doc["model_catalog_json"])}
+        if catalog is not None
+        else {},
+    )
 
 
 MANAGED_MCP_CONFIG_KEY = "mcp_servers"
