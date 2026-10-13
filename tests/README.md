@@ -61,6 +61,9 @@ Child HTTP matching accepts Claude's single appended transport newline after the
 checkpoint; additional text, whitespace, and Codex prompt changes remain rejected.
 Offline CUJ regressions cover Codex delegated-turn completion and exact task-request matching;
 notifications alone, Claude title requests, and parent continuations do not qualify.
+Codex parent-turn evidence accepts native runtime-context updates for the same turn, including
+midnight date changes. Untagged, mixed user/context, and other-turn messages still end the match;
+duplicate prompts remain rejected.
 Unrelated and pre-checkpoint request bodies are excluded before JSON decoding.
 The original smart-routing CUJ runs four fresh sessions: routed and explicit model for both
 Claude and Codex. One additional test has five `SMART_ROUTER_CONFIG_VERSION` cases.

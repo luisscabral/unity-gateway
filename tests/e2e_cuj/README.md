@@ -88,6 +88,10 @@ not that an assistant echoed it or a skill merely existed on disk.
 Task inference must contain the exact task/routed prompt and tools, excluding Claude title
 requests and parent continuations from child-inference checks. Only Claude child requests
 after the routing checkpoint may append one transport newline to that exact prompt.
+Codex parent evidence requires the exact prompt and a completed native turn. Runtime-context
+messages, including midnight date updates, are ignored only when their native metadata identifies
+context alone and the active turn. New or duplicate user prompts and other-turn updates remain
+rejected. Offline regressions cover each case.
 Parent and child requests use the same verified thinking-display recovery as CUJ3:
 only known display/safeguards rejections followed by native removal of the rejected field
 and a final non-empty 200 are accepted. Model, prompt, budget, and effort must remain unchanged.
